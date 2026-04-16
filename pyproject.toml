@@ -1,0 +1,21 @@
+[project]
+name = "xla-eval"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "pandas>=2.3.3",
+    "torch==2.7.0",
+    "torch-xla @ https://storage.googleapis.com/pytorch-xla-releases/wheels/cuda/12.6/torch_xla-2.7.0-cp310-cp310-manylinux_2_28_x86_64.whl",
+    "triton>=3.6.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
