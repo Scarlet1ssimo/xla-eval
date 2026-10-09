@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.10.*"
 
 [[package]]
@@ -408,8 +408,8 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.7.0%2Bcu126-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:9dcf77ddf385412a1eea276e9b812de11c3092f7ed29508a5abef064984da3a0" },
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.7.0%2Bcu126-cp310-cp310-win_amd64.whl", hash = "sha256:587dec2f6c9e3316faea05f22434a386d402cf02d6faeb97a8978f73b3a0ed7a" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.7.0%2Bcu126-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:9dcf77ddf385412a1eea276e9b812de11c3092f7ed29508a5abef064984da3a0", upload-time = "2025-04-22T18:16:34Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.7.0%2Bcu126-cp310-cp310-win_amd64.whl", hash = "sha256:587dec2f6c9e3316faea05f22434a386d402cf02d6faeb97a8978f73b3a0ed7a", upload-time = "2025-04-22T18:16:35Z" },
 ]
 
 [[package]]
@@ -486,6 +486,7 @@ dependencies = [
     { name = "pandas" },
     { name = "torch" },
     { name = "torch-xla" },
+    { name = "triton" },
 ]
 
 [package.metadata]
@@ -493,4 +494,5 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "torch", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torch-xla", url = "https://storage.googleapis.com/pytorch-xla-releases/wheels/cuda/12.6/torch_xla-2.7.0-cp310-cp310-manylinux_2_28_x86_64.whl" },
+    { name = "triton", specifier = "==3.3.0" },
 ]
