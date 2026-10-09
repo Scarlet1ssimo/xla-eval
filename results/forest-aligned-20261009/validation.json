@@ -1,0 +1,27 @@
+{
+  "cases": 10,
+  "final_observations": 20,
+  "passed": 20,
+  "incorrect_final": 0,
+  "cpu_fallback_final": 0,
+  "numerics": "relative_l2 < 0.005; normalized_max_abs < 0.02; all finite; both before/after measurement",
+  "source_equivalence": "all five canonical functions exactly match measured equations on additional non-square CPU inputs",
+  "physical_abi_and_settings": "all ten match FOREST cases and protocol",
+  "gpu_exclusive": false,
+  "concurrent_gpu_process_observed": "Other user GPU contexts were present. Thermal/idle cooldown checks passed, but exclusivity was not enforced.",
+  "rejected_attempts": [
+    {
+      "case": "gqa-attention B1",
+      "variant": "explicit FP16 matmul/softmax",
+      "status": "incorrect",
+      "normalized_max_abs": 0.020526972537495185,
+      "included_in_report": false
+    },
+    {
+      "case": "efficient-vit B1 smoke",
+      "variant": "CUDA event on DLPack stream without XLA barrier",
+      "status": "invalid timer: event did not encompass compute",
+      "included_in_report": false
+    }
+  ]
+}
