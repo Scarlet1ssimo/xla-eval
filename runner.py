@@ -1,351 +1,218 @@
+"""Isolated cases, bounded workers, validated results and both timing reports."""
+
 from __future__ import annotations
-
-from dataclasses import dataclass
+import csv
 from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import time
-from typing import Callable, Literal
+import uuid
 
-import pandas as pd
-import torch
-
-try:
-    import triton  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover - optional dependency
-    triton = None
-
-from kernels.efficientvit.torch import efficientvit_pytorch
-from kernels.flashattn.torch import flashattn_pytorch, set_flashattn_sdpa_backend
-from kernels.gqa.torch import gqa_pytorch, set_gqa_sdpa_backend
-from kernels.layernorm_matmul.torch import layernorm_matmul_pytorch
-from kernels.rmsnorm_swiglu.torch import rmsnorm_swiglu_pytorch
-
-try:
-    import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
-except ImportError as exc:  # pragma: no cover - optional dependency
-    xm = None
-    _xla_import_error = f"ImportError: {exc}"
-else:
-    _xla_import_error = None
+ROOT = Path(__file__).resolve().parent
+CASES = (
+    "attention",
+    "gqa-attention",
+    "layernorm-matmul",
+    "rms-ffn-swiglu",
+    "efficient-vit",
+)
 
 
-BackendName = Literal["torch_flash", "torch_cudnn", "torch_xla"]
-TimerName = Literal["triton_do_bench", "perf_counter"]
-CompileModeName = Literal["default", "reduce-overhead", "max-autotune"]
-
-
-@dataclass(frozen=True)
-class BenchmarkArtifacts:
-    csv_path: Path
-    dataframe: pd.DataFrame
-
-
-@dataclass(frozen=True)
-class BenchmarkConfig:
-    backends: tuple[BackendName, ...] = ("torch_flash", "torch_cudnn", "torch_xla")
-    batches: tuple[int, ...] = (1, 16)
-    dtype: str = "float16"
-    timer: TimerName = "triton_do_bench"
-    torch_compile: bool = True
-    torch_compile_mode: CompileModeName = "max-autotune"
-    warmup: int = 25
-    rep: int = 100
-    output_dir: Path = Path("outputs")
-    output_prefix: str = "perf"
-
-
-@dataclass(frozen=True)
-class _CaseDef:
-    name: str
-    build: Callable[[torch.device, torch.dtype, int], "_CaseRuntime"]
-
-
-@dataclass(frozen=True)
-class _CaseRuntime:
-    fn: Callable[..., torch.Tensor]
-    args: tuple[torch.Tensor, ...]
-    flops: float
-
-
-def _dtype_from_name(dtype_name: str) -> torch.dtype:
-    if dtype_name == "float16":
-        return torch.float16
-    if dtype_name == "bfloat16":
-        return torch.bfloat16
-    if dtype_name == "float32":
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {dtype_name}")
-
-
-def _backend_device(backend: BackendName) -> torch.device:
-    if backend in ("torch_flash", "torch_cudnn"):
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
-
-    if xm is None:
-        detail = f" ({_xla_import_error})" if _xla_import_error else ""
-        raise RuntimeError(
-            "torch_xla is unavailable for backend=torch_xla"
-            f"{detail}. This is often caused by torch / torch-xla version mismatch."
+def write_reports(directory):
+    rows = []
+    for b in (1, 16):
+        for name in CASES:
+            d = directory / name / f"B{b}"
+            if not (d / "settings.json").exists():
+                continue
+            row = {"workload": name, "B": b}
+            for source, file in (
+                ("xla", "event-result.json"),
+                ("xla_gpu_trace", "result.json"),
+            ):
+                p = d / file
+                if not p.exists():
+                    row[source] = {"status": "missing"}
+                    continue
+                row[source] = json.loads(p.read_text())
+            rows.append(row)
+    (directory / "summary.json").write_text(json.dumps(rows, indent=2) + "\n")
+    for file, metric in (
+        ("tflops.csv", "effective_tflops"),
+        ("latency.csv", "latency_ms"),
+    ):
+        with (directory / file).open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["workload", "B", "xla", "xla_gpu_trace"])
+            w.writeheader()
+            for row in rows:
+                output = {k: row[k] for k in ("workload", "B")}
+                for source in ("xla", "xla_gpu_trace"):
+                    r = row[source]
+                    if r["status"] == "ok":
+                        output[source] = (
+                            r.get(metric)
+                            if metric != "latency_ms"
+                            else r.get(metric, {}).get("median")
+                        )
+                w.writerow(output)
+    for row in rows:
+        print(
+            row["workload"],
+            row["B"],
+            {
+                s: round(row[s].get("effective_tflops", 0), 4)
+                if row[s]["status"] == "ok"
+                else row[s]["status"]
+                for s in ("xla", "xla_gpu_trace")
+            },
+            flush=True,
         )
-    return xm.xla_device()
+    return rows
 
 
-def _sync(backend: BackendName, device: torch.device) -> None:
-    if backend in ("torch_flash", "torch_cudnn"):
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        return
-
-    # torch-xla uses lazy execution; explicit step + wait makes timing stable.
-    xm.mark_step()
-    xm.wait_device_ops()
-
-
-def _maybe_compile_torch_fn(
-    fn: Callable[..., torch.Tensor],
-    *,
-    mode: CompileModeName,
-) -> Callable[..., torch.Tensor]:
-    # Keep benchmark runnable on older PyTorch versions.
-    if not hasattr(torch, "compile"):
-        return fn
-
-    try:
-        compiled_fn = torch.compile(fn, mode=mode)
-    except RuntimeError as exc:
-        print(f"Warning: torch.compile failed; falling back to eager mode ({exc})")
-        return fn
-
-    state = {"use_eager": False}
-
-    def _wrapped(*args: torch.Tensor) -> torch.Tensor:
-        if state["use_eager"]:
-            return fn(*args)
-        try:
-            return compiled_fn(*args)
-        except RuntimeError as exc:
-            # Some kernels can fail at runtime for specific shapes/dtypes.
-            print(f"Warning: compiled run failed; switching to eager mode ({exc})")
-            state["use_eager"] = True
-            return fn(*args)
-
-    return _wrapped
-
-
-def _run_triton_do_bench(
-    fn: Callable[..., torch.Tensor],
-    *,
-    warmup: int,
-    rep: int,
-) -> float:
-    if triton is None:
-        raise RuntimeError(
-            "timer=triton_do_bench requires triton to be installed in xla_eval environment"
+def run(
+    output_dir=None,
+    forest_root=Path.home() / "forest",
+    timeout_s=600,
+    gpu_trace=True,
+):
+    directory = (
+        Path(output_dir)
+        if output_dir
+        else ROOT
+        / "outputs"
+        / (
+            "forest-aligned-"
+            + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:8]
         )
-
-    result = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.1, 0.9])
-    if result is None:
-        raise RuntimeError("triton.testing.do_bench returned no timing result")
-
-    ms, _, _ = result
-    return float(ms)
-
-
-def _benchmark_fn(
-    *,
-    backend: BackendName,
-    device: torch.device,
-    timer: TimerName,
-    warmup: int,
-    rep: int,
-    fn: Callable[..., torch.Tensor],
-    args: tuple[torch.Tensor, ...],
-    flops: float,
-) -> tuple[float, float]:
-    if warmup < 0 or rep <= 0:
-        raise ValueError("warmup must be >= 0 and rep must be > 0")
-
-    if timer == "triton_do_bench" and backend in ("torch_flash", "torch_cudnn") and device.type == "cuda":
-        ms = _run_triton_do_bench(lambda: fn(*args), warmup=warmup, rep=rep)
-        tflops = flops / (ms * 1e-3) / 1e12
-        return ms, tflops
-
-    for _ in range(warmup):
-        _ = fn(*args)
-        _sync(backend, device)
-
-    start = time.perf_counter()
-    for _ in range(rep):
-        _ = fn(*args)
-        _sync(backend, device)
-    elapsed = time.perf_counter() - start
-
-    ms = elapsed * 1e3 / rep
-    tflops = flops / (ms * 1e-3) / 1e12
-    return ms, tflops
-
-
-def _flashattn_case(
-    device: torch.device, dtype: torch.dtype, batch: int
-) -> _CaseRuntime:
-    # Base shape (llama2-7b): M=4096, N=4096, D=128, L=128, H=32
-    # m, n, d, h = 4096, 4096, 128, 32
-    m, n, d, h = 16, 4096, 64, 16
-    bh = batch * h
-    # q = torch.randn((bh, m, d), device=device, dtype=dtype)
-    # k = torch.randn((bh, n, d), device=device, dtype=dtype)
-    # v = torch.randn((bh, n, d), device=device, dtype=dtype)
-    q = torch.randn((batch, h, m, d), device=device, dtype=dtype)
-    k = torch.randn((batch, h, n, d), device=device, dtype=dtype)
-    v = torch.randn((batch, h, n, d), device=device, dtype=dtype)
-    # print(f"{bh=}, {m=}, {n=}, {d=}")
-    # print(f"{q.shape=}, {k.shape=}, {v.shape=}")
-
-    return _CaseRuntime(
-        fn=flashattn_pytorch,
-        args=(q, k, v),
-        flops=4.0 * bh * m * n * d,
     )
-
-
-def _gqa_case(
-    device: torch.device, dtype: torch.dtype, batch: int
-) -> _CaseRuntime:
-    # Base shape (llama3-8b): M=4096, N=4096, D=128, L=128, G=8, R=4
-    # m, n, d, l, g, r = 4096, 4096, 128, 128, 8, 4
-    m, n, d, l, g, r = 256, 4096, 64, 64, 1, 2
-    bg = batch * g
-    q = torch.randn((batch, g, r, m, d), device=device, dtype=dtype)
-    k = torch.randn((batch, g, n, d), device=device, dtype=dtype)
-    v = torch.randn((batch, g, n, l), device=device, dtype=dtype)
-    
-    print(f"{bg=}, {m=}, {n=}, {d=}, {l=}, {g=}, {r=}")
-    print(f"{q.shape=}, {k.shape=}, {v.shape=}")
-
-    return _CaseRuntime(
-        fn=gqa_pytorch,
-        args=(q, k, v),
-        flops=2.0 * bg * r * m * n * (d + l),
+    directory = directory.resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    for file in ("main.py", "runner.py", "pyproject.toml", "uv.lock"):
+        shutil.copy2(ROOT / file, directory / file)
+    shutil.copytree(
+        ROOT / "scripts",
+        directory / "scripts",
+        ignore=shutil.ignore_patterns("__pycache__"),
     )
-
-
-def _efficientvit_case(
-    device: torch.device, dtype: torch.dtype, batch: int
-) -> _CaseRuntime:
-    # Base shape: B=1,16, N=128
-    n = 128
-    q = torch.randn((batch, n, n), device=device, dtype=dtype)
-    k = torch.randn((batch, n, n), device=device, dtype=dtype)
-    v = torch.randn((batch, n, n), device=device, dtype=dtype)
-
-    return _CaseRuntime(
-        fn=efficientvit_pytorch,
-        args=(q, k, v),
-        flops=4.0 * batch * n * n * n + 2.0 * batch * n * n,
+    shutil.copytree(
+        ROOT / "kernels",
+        directory / "kernels",
+        ignore=shutil.ignore_patterns("__pycache__"),
     )
-
-
-def _layernorm_matmul_case(
-    device: torch.device, dtype: torch.dtype, batch: int
-) -> _CaseRuntime:
-    # Base shape (llama2-70b): M=1, K=8192, N=28672
-    m, k, n = batch * 1, 8192, 28672
-    
-    x = torch.randn((m, k), device=device, dtype=dtype)
-    y = torch.randn((n, k), device=device, dtype=dtype)
-
-    return _CaseRuntime(
-        fn=layernorm_matmul_pytorch,
-        args=(x, y),
-        flops=2.0 * m * n * k,
-    )
-
-
-def _rmsnorm_swiglu_case(
-    device: torch.device, dtype: torch.dtype, batch: int
-) -> _CaseRuntime:
-    # Base shape (mobilevit-xxs): M=4096, D=96, N=96, K=192
-    m, d, n, k = batch * 4096, 96, 96, 192
-    x = torch.randn((m, d), device=device, dtype=dtype)
-    wv = torch.randn((2 * k, d), device=device, dtype=dtype)
-    u = torch.randn((n, k), device=device, dtype=dtype)
-
-    return _CaseRuntime(
-        fn=rmsnorm_swiglu_pytorch,
-        args=(x, wv, u),
-        flops=2.0 * m * k * d * 2 + 2.0 * m * n * k,
-    )
-
-
-def _case_defs() -> tuple[_CaseDef, ...]:
-    return (
-        _CaseDef("flashattn", _flashattn_case),
-        _CaseDef("gqa", _gqa_case),
-        _CaseDef("layernorm", _layernorm_matmul_case),
-        _CaseDef("rms_norm", _rmsnorm_swiglu_case),
-        _CaseDef("efficientvit", _efficientvit_case),
-    )
-
-
-def run_benchmark(config: BenchmarkConfig) -> BenchmarkArtifacts:
-    torch.set_grad_enabled(False)
-    dtype = _dtype_from_name(config.dtype)
-    rows: list[dict[str, object]] = []
-
-    for backend in config.backends:
-        print(f"Running benchmark for backend={backend} on device={_backend_device(backend)} with dtype={dtype}")
-        device = _backend_device(backend)
-
-        if backend == "torch_flash":
-            set_flashattn_sdpa_backend("flash")
-            set_gqa_sdpa_backend("flash")
-        elif backend == "torch_cudnn":
-            set_flashattn_sdpa_backend("cudnn")
-            set_gqa_sdpa_backend("cudnn")
-
-        for case in _case_defs():
-            print(f"  Case: {case.name}")
-            for batch in config.batches:
-                runtime = case.build(device, dtype, batch)
-                fn = runtime.fn
-                if (
-                    config.torch_compile
-                    and backend in ("torch_flash", "torch_cudnn")
-                    and case.name not in ("flashattn", "gqa")
-                ):
-                    print(f"    Compiling with torch.compile (mode={config.torch_compile_mode})...")
-                    fn = _maybe_compile_torch_fn(fn, mode=config.torch_compile_mode)
-
-                ms, tflops = _benchmark_fn(
-                    backend=backend,
-                    device=device,
-                    timer=config.timer,
-                    warmup=config.warmup,
-                    rep=config.rep,
-                    fn=fn,
-                    args=runtime.args,
-                    flops=runtime.flops,
+    with (directory / "prepare.log").open("w") as log:
+        subprocess.run(
+            [
+                str(forest_root / "benchmarks/.venv/bin/python"),
+                str(ROOT / "scripts/prepare_forest_inputs.py"),
+                "--forest-root",
+                str(forest_root),
+                "--output-dir",
+                str(directory),
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+    for b in (1, 16):
+        for name in CASES:
+            d = directory / name / f"B{b}"
+            for profiled in [True, False] if gpu_trace else [False]:
+                file = "result.json" if profiled else "event-result.json"
+                cmd = [
+                    str(ROOT / "scripts/xla_python.sh"),
+                    str(ROOT / "scripts/profile_forest_aligned.py"),
+                    "--directory",
+                    str(d),
+                    "--result-name",
+                    file,
+                ]
+                if profiled:
+                    cmd = [
+                        "/software/cuda-13.0/bin/nsys",
+                        "profile",
+                        "--trace=cuda,nvtx",
+                        "--sample=none",
+                        "--cpuctxsw=none",
+                        "--force-overwrite=true",
+                        "-o",
+                        str(d / "profile"),
+                        *cmd,
+                    ]
+                print(
+                    "START",
+                    name,
+                    "B=" + str(b),
+                    "gpu-trace" if profiled else "do_bench",
+                    flush=True,
                 )
-                rows.append(
-                    {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "backend": backend,
-                        "device": str(device),
-                        "case": case.name,
-                        "batch": batch,
-                        "dtype": config.dtype,
-                        "warmup": config.warmup,
-                        "rep": config.rep,
-                        "estimated_flops": runtime.flops,
-                        "ms_per_iter": ms,
-                        "tflops": tflops,
-                    }
-                )
-
-    df = pd.DataFrame(rows)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = config.output_dir / f"{config.output_prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
-    df.to_csv(out_path, index=False)
-    return BenchmarkArtifacts(csv_path=out_path, dataframe=df)
+                try:
+                    with (d / ("worker.log" if profiled else "event-worker.log")).open(
+                        "w"
+                    ) as log:
+                        subprocess.run(
+                            ["timeout", "--kill-after=15s", str(timeout_s) + "s", *cmd],
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            env={
+                                **os.environ,
+                                "FOREST_ROOT": str(forest_root.resolve()),
+                            },
+                            check=True,
+                        )
+                    if profiled:
+                        with (d / "export.log").open("w") as log:
+                            subprocess.run(
+                                [
+                                    "/software/cuda-13.0/bin/nsys",
+                                    "export",
+                                    "--type",
+                                    "sqlite",
+                                    "--force-overwrite=true",
+                                    "--output",
+                                    str(d / "profile.sqlite"),
+                                    str(d / "profile.nsys-rep"),
+                                ],
+                                stdout=log,
+                                stderr=subprocess.STDOUT,
+                                check=True,
+                            )
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                str(ROOT / "scripts/summarize_gpu_trace.py"),
+                                str(d),
+                            ],
+                            check=True,
+                        )
+                except Exception as e:
+                    p = d / file
+                    r = (
+                        json.loads(p.read_text())
+                        if p.exists()
+                        else {"settings": json.loads((d / "settings.json").read_text())}
+                    )
+                    r.update(
+                        status="timeout"
+                        if isinstance(e, subprocess.CalledProcessError)
+                        and e.returncode in (124, 137)
+                        else "failed",
+                        orchestration_error=str(e),
+                    )
+                    p.write_text(json.dumps(r, indent=2) + "\n")
+    rows = write_reports(directory)
+    (directory / "elapsed.json").write_text(
+        json.dumps(
+            {"elapsed_s": time.monotonic() - started, "timeout_s": timeout_s}, indent=2
+        )
+        + "\n"
+    )
+    print("Results:", directory, flush=True)
+    return rows
