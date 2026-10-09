@@ -15,9 +15,9 @@ def rmsnorm_swiglu_pytorch_ref(
 
     Args:
         X: Input tensor of shape (M, D).
-        W: Gate weight tensor of shape (K, D).
-        V: Weight tensor of shape (K, D).
-        U: Weight tensor of shape (N, K).
+        W: Gate weight tensor of shape (D, K).
+        V: Weight tensor of shape (D, K).
+        U: Weight tensor of shape (K, N).
     Returns:
         Output tensor of shape (M, N).
     """
@@ -25,12 +25,12 @@ def rmsnorm_swiglu_pytorch_ref(
     normalized_X = F.rms_norm(X, normalized_shape=X.shape[-1:], eps=eps)
 
     # SwiGLU
-    gate = torch.matmul(normalized_X, W.T)
-    value = torch.matmul(normalized_X, V.T)
+    gate = torch.matmul(normalized_X, W)
+    value = torch.matmul(normalized_X, V)
     swiglu = F.silu(gate) * value
 
     # Final linear transformation
-    output = torch.matmul(swiglu, U.T)
+    output = torch.matmul(swiglu, U)
     return output
 
 
@@ -47,9 +47,9 @@ def rmsnorm_swiglu_pytorch_ref_plain(
 
     Args:
         X: Input tensor of shape (M, D).
-        W: Gate weight tensor of shape (K, D).
-        V: Weight tensor of shape (K, D).
-        U: Weight tensor of shape (N, K).
+        W: Gate weight tensor of shape (D, K).
+        V: Weight tensor of shape (D, K).
+        U: Weight tensor of shape (K, N).
     Returns:
         Output tensor of shape (M, N).
     """
@@ -58,12 +58,12 @@ def rmsnorm_swiglu_pytorch_ref_plain(
     normalized_X = X / rms
 
     # SwiGLU
-    gate = torch.matmul(normalized_X, W.T)
-    value = torch.matmul(normalized_X, V.T)
+    gate = torch.matmul(normalized_X, W)
+    value = torch.matmul(normalized_X, V)
     swiglu = (gate * torch.sigmoid(gate)) * value
 
     # Final linear transformation
-    output = torch.matmul(swiglu, U.T)
+    output = torch.matmul(swiglu, U)
     return output
 
 
@@ -79,7 +79,7 @@ def rmsnorm_swiglu_pytorch(
     Args:
         X: Input tensor of shape (M, D).
         WV: Gate and value weight tensor of shape (2*K, D).
-        U: Weight tensor of shape (N, K).
+        U: Weight tensor of shape (K, N).
     Returns:
         Output tensor of shape (M, N).
     """
@@ -92,7 +92,7 @@ def rmsnorm_swiglu_pytorch(
     swiglu = F.silu(gate) * value
 
     # Final linear transformation
-    output = torch.matmul(swiglu, U.T)
+    output = torch.matmul(swiglu, U)
     return output
 
 
@@ -108,7 +108,7 @@ def rmsnorm_swiglu_pytorch_plain(
     Args:
         X: Input tensor of shape (M, D).
         WV: Gate and value weight tensor of shape (2*K, D).
-        U: Weight tensor of shape (N, K).
+        U: Weight tensor of shape (K, N).
     Returns:
         Output tensor of shape (M, N).
     """
@@ -122,5 +122,5 @@ def rmsnorm_swiglu_pytorch_plain(
     swiglu = (gate * torch.sigmoid(gate)) * value
 
     # Final linear transformation
-    output = torch.matmul(swiglu, U.T)
+    output = torch.matmul(swiglu, U)
     return output

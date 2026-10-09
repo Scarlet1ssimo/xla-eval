@@ -11,7 +11,7 @@ def layernorm_matmul_pytorch(
 
     Args:
         X: Input tensor of shape (M, K).
-        Y: Weight tensor of shape (N, K).
+        Y: Weight tensor of shape (K, N).
     Returns:
         Output tensor of shape (M, N).
     """
@@ -19,7 +19,7 @@ def layernorm_matmul_pytorch(
     X_normalized = torch.nn.functional.layer_norm(X, X.shape[-1:], eps=eps)
 
     # MatMul
-    output = torch.matmul(X_normalized, Y.T)
+    output = torch.matmul(X_normalized, Y)
     return output
 
 
@@ -33,7 +33,7 @@ def layernorm_matmul_pytorch_plain(
 
     Args:
         X: Input tensor of shape (M, K).
-        Y: Weight tensor of shape (N, K).
+        Y: Weight tensor of shape (K, N).
     Returns:
         Output tensor of shape (M, N).
     """
@@ -43,5 +43,5 @@ def layernorm_matmul_pytorch_plain(
     X_normalized = (X - mean) / torch.sqrt(var + eps)
 
     # MatMul
-    output = torch.matmul(X_normalized, Y.T)
+    output = torch.matmul(X_normalized, Y)
     return output
