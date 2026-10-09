@@ -46,7 +46,11 @@ def write_reports(directory):
         ("latency.csv", "latency_ms"),
     ):
         with (directory / file).open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["workload", "B", "xla", "xla_gpu_trace"])
+            w = csv.DictWriter(
+                f,
+                fieldnames=["workload", "B", "xla", "xla_gpu_trace"],
+                lineterminator="\n",
+            )
             w.writeheader()
             for row in rows:
                 output = {k: row[k] for k in ("workload", "B")}
