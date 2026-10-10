@@ -48,7 +48,9 @@ and excluded from performance tables. Output must satisfy the contiguous ABI.
 ## Timing columns
 
 - **`xla`**: uninstrumented `triton.testing.do_bench`, flush L2, 10 initial warmup
-  calls, 200 ms measurement budget, median/p20/p80. XLA uses another CUDA stream,
+  calls, a measurement budget inherited from FOREST's `BENCHMARK_MS` (currently
+  2000 ms), median/p20/p80. Existing results retain the budget recorded in their
+  per-case `settings.json`. XLA uses another CUDA stream,
   so the wrapper finishes the L2 flush before submitting XLA work, and waits for
   XLA completion before recording the end event. These CUDA-event samples include
   the necessary host submission/wait gap. They cover the complete invocation.
