@@ -49,7 +49,7 @@ and excluded from performance tables. Output must satisfy the contiguous ABI.
 
 - **`xla`**: uninstrumented `triton.testing.do_bench`, flush L2, 10 initial warmup
   calls, a measurement budget inherited from FOREST's `BENCHMARK_MS` (currently
-  2000 ms), median/p20/p80. Existing results retain the budget recorded in their
+  200 ms), median/p20/p80. Existing results retain the budget recorded in their
   per-case `settings.json`. XLA uses another CUDA stream,
   so the wrapper finishes the L2 flush before submitting XLA work, and waits for
   XLA completion before recording the end event. These CUDA-event samples include
@@ -66,11 +66,15 @@ and excluded from performance tables. Output must satisfy the contiguous ABI.
 Both modes exclude compilation, input generation/transfer and correctness from
 timing. Numerical checks run before and after measurement with FOREST's original
 relative-L2 <0.005, normalized-max <0.02 and finite-output gates. Before each
-measurement, the unchanged FOREST cooldown requires at least 5 seconds, GPU
+measurement, the unchanged FOREST cooldown requires at least 20 seconds, GPU
 <=55 C, utilization <=5%, stable for 1 second, capped at 60 seconds. Worker budget
 is 600 seconds; no unsuccessful partial result is published. Clock/power settings
 are not modified. Shared GPU contexts must be disclosed; cooldown alone does not
-prove exclusive GPU use.
+prove exclusive GPU use. New fixtures inherit both `BENCHMARK_MS` and
+`COOLDOWN_S` from FOREST; regenerate fixtures after a protocol change. No
+minimum sample count is imposed; existing fixtures/results retain their saved
+settings. The shared protocol is documented in FOREST's `benchmarks/README.md`
+under "Shared final measurement protocol".
 
 Artifacts include `tflops.csv`, `latency.csv` (**milliseconds**), `summary.json`,
 per-case settings, input/reference fixtures, pre/post validation, cooldown samples,
